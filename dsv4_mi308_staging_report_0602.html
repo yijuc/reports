@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<title>DSV4-Pro MI308 / gfx942 — Pollution + RoPE + FP8 fix Report</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+         max-width: 1100px; margin: 32px auto; padding: 0 24px; color: #1f2328; line-height: 1.6; }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: 8px; }
+  h2 { margin-top: 36px; border-bottom: 1px solid #d0d7de; padding-bottom: 4px; }
+  h3 { margin-top: 24px; color: #24292f; }
+  table { border-collapse: collapse; margin: 12px 0; width: 100%; font-size: 14px; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  code { background: #f6f8fa; padding: 1px 6px; border-radius: 3px; font-size: 92%; }
+  pre  { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  .ok    { color: #0a7f37; font-weight: 600; }
+  .warn  { color: #bf6a02; font-weight: 600; }
+  .bad   { color: #a40e26; font-weight: 600; }
+  .small { color: #57606a; font-size: 12px; }
+  .callout { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<h1>DSV4-Pro MI308 / gfx942 — Pollution + RoPE + FP8 fix Report</h1>
+<p class="small">
+  Image: <code>yijuchen/private:eveline_dsv4_fix_pollution_rope_staging_0602</code>　|　
+  Commit 狀態: <span class="warn">部分vllm推上https://github.com/AFDEAPAC/vllm/tree/amd_dsv4_mi308_gfx942_fix_pollution_no_rebase</span>
+</p>
+
+
+<h2>1. 目前修復內容Summary</h2>
+<ul>
+  <li><strong>FP8 cast 格式</strong>：fused compressor Triton kernel 寫入 KV cache 時的 cast 格式從 IEEE E4M3 (<code>tl.float8e4nv</code>) 改成 AMD bias-8 E4M3 (<code>tl.float8e4b8</code>)，避免 mantissa 截斷。</li>
+  <li><strong>RoPE position floor</strong>：移除 <code>(position // 128) * 128</code> 的 floor，每 token 用真實 position 對應的 rotary 角度。</li>
+  <li><strong>ROCm RMSNorm + FP8 fused tie boundary</strong>：fused kernel 強制 <code>float → scalar_t → float</code> round-trip，匹配 unfused composite 在 E4M3 tie 上的行為。</li>
+  <li><strong>ATOM Triton FP4 SiLU MoE</strong>：cudagraph-safe MXFP4 MoE backend（routed stage1/2 + active-expert metadata）。</li>
+  <li><strong>Sparse MLA backend</strong>：split-K nope/rope 拆段、prefill chunk topk 處理，配合 gfx942 sparse attention kernel。</li>
+</ul>
+
+<h2>2. 驗證結果</h2>
+
+<h3>2.1 Trigger threshold scan（沒開 prefix cache，誘發測試）</h3>
+<p>
+每格做：<code>fresh GSM8K (LIMIT=16, NUM_FEWSHOT=8) → vllm bench serve trigger → post1 GSM8K</code>，同一個 server 不重啟，<strong>已關閉 prefix cache</strong>。
+</p>
+<table>
+  <tr><th>Trigger (input / output / np / conc)</th><th>fresh (flex/strict)</th><th>post1 (flex/strict)</th><th>判定</th></tr>
+  <tr><td>4096 / 128 / 4 / 2</td><td>0.8125</td><td>0.9375</td><td><span class="ok">❌ 不誘發</span></td></tr>
+  <tr><td>4096 / 256 / 4 / 2</td><td>0.8125</td><td>0.875</td><td><span class="ok">❌ 不誘發</span></td></tr>
+  <tr><td>4096 / 512 / 4 / 2</td><td>0.8125</td><td>0.875</td><td><span class="ok">❌ 不誘發</span></td></tr>
+  <tr><td>6144 / 128 / 4 / 2</td><td>0.8125</td><td>0.9375</td><td><span class="ok">❌ 不誘發</span></td></tr>
+  <tr><td>6144 / 256 / 4 / 2</td><td>0.8125</td><td>0.875</td><td><span class="ok">❌ 不誘發</span></td></tr>
+  <tr><td>8192 / 128 / 4 / 2</td><td>0.8125</td><td>0.875</td><td><span class="ok">❌ 不誘發</span></td></tr>
+  <tr><td>8192 / 256 / 4 / 2</td><td>0.8125</td><td>0.8125</td><td><span class="ok">❌ 持平（1 doc 互換）</span></td></tr>
+  <tr><td><strong>10240 / 512 / 2 / 2</strong></td><td>0.8125</td><td>0.875</td><td><span class="ok">❌ 不誘發</span></td></tr>
+</table>
+<p>
+<strong>8/8 cell 沒看到 post1 &lt; fresh 的方向性下降。</strong>所有 +1 doc 改善都來自 doc 7 在 cold→warm 轉換中被「修對」（boundary doc 對 first-call 數值敏感），不是 model 真的變聰明。
+</p>
+
+<h2>3. 仍待調查的點</h2>
+<div class="callout">
+<strong>下一個懷疑點：<code>--enable-prefix-cache</code> + 殘餘 drift / instability</strong>
+</div>
+<p>
+觀察：
+</p>
+<ul>
+  <li><strong>有開 prefix cache 連跑兩次 GSM8K LIMIT=16</strong>：曾經看到 fresh <code>0.9375</code> → post1 <code>0.75</code>（掉 3 doc），server log 顯示 prefix cache hit rate 從 0% 跳到 18.9%，run1 的 KV blocks 被 reuse。</li>
+  <li><strong>過去 patched server <code>--no-enable-prefix-caching</code> 設定下</strong>：也看過 fresh <code>0.8125</code> → post1 <strong><code>0.9375</code></strong>（多答對 2 doc，反而上升），且 wrong-doc set 在 cold→warm 之間反覆翻動。意味著 LIMIT=16 + 8-shot fewshot 的 evaluation 本身有 ±0.0625 ~ ±0.1875 的 sampling 雜訊。</li>
+</ul>
+<p>
+單一 0.9375 → 0.75 觀察不能直接歸因於 prefix cache pollution，要先關 prefix cache + 重複多次量化 instability 範圍，才能判別「真的有 drift 累積」vs「只是 sampling variance」。如果關掉 prefix cache 後仍方向性下降，則往 Lightning Indexer / MoE expert routing 兩個尚未排除的 drift 源頭追。</p>
+
+<h2>4. 其他性能分析</h2>
+
+<h3>4.1 <code>MAX_NUM_BATCHED_TOKENS</code> 與 acc 的 trade-off</h3>
+<p>
+過去實驗中發現提高 <code>MAX_NUM_BATCHED_TOKENS</code>（從 default <code>1024</code> 拉到更大）可以降低 prefill TTFT、改善整體 wall-clock，
+但在 GSM8K LIMIT=16 上會出現方向性下滑。
+診斷時對較大 batch 做 routed MoE compare：cosine 趨近 <code>1.0</code>，但個別 element <code>max_abs</code> 仍偏大，
+意味著聚合方向沒問題、但個別 logit 已經偏離過多。<strong>所以拉高 batched-tokens 的 TTFT 改善是付出 acc 的代價換來的</strong>，
+不能直接調作 accuracy-stable 的主線設定。
+</p>
+<p class="small">
+進一步追蹤方向：(a) 在較大 batch 下逐個關閉 ragged / offset-grid / deterministic-reduce，看是哪個環節在 batch 增大時數值不穩；
+(b) 試大 batch + <code>CONC=1</code> 配合 chunked prefill 重切，避免 single-batch 內 routed accumulation 過長；
+(c) 比對不同 <code>MAX_NUM_BATCHED_TOKENS</code> 的 wrong-doc set，看哪些 doc 是大 batch 才壞，可以反推 fp8 drift 的觸發條件。
+</p>
+
+<hr/>
+<p class="small">
+本報告為 docker image smoke test，定版 commit 還沒更新 GitHub。後續若 prefix cache 那條路驗清楚，會再更新 staging_report.html 並推 commit。
+</p>
+
+</body>
+</html>
