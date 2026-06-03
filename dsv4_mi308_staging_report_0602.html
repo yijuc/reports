@@ -39,7 +39,7 @@
   <li><strong>Sparse MLA backend</strong>：split-K nope/rope 拆段、prefill chunk topk 處理，配合 gfx942 sparse attention kernel。</li>
 </ul>
 
-<h2>2. 驗證結果</h2>
+<h2>2. 汙染驗證結果</h2>
 
 <h3>2.1 Trigger threshold scan（沒開 prefix cache，誘發測試）</h3>
 <p>
@@ -108,6 +108,197 @@ acc 確切數字請參考歷史紀錄；本表僅作 perf 趨勢與「acc 會掉
 (c) 試大 batch + <code>CONC=1</code> 配合 chunked prefill 重切，避免 single-batch 內 routed accumulation 過長；
 (d) 比對不同 <code>MAX_NUM_BATCHED_TOKENS</code> 的 wrong-doc set，看哪些 doc 是大 batch 才壞，可以反推 fp8 drift 的觸發條件。
 </p>
+
+<h3>4.2 <code>--enable-prefix-caching</code> 與 acc 的 trade-off</h3>
+<p>
+延續 §3 的懷疑點，在<strong>套 patch 後的 image</strong>（<code>yijuchen/private:eveline_dsv4_fix_pollution_rope_staging_0602</code>）做了對照測試，bench 配置同樣 <code>random 10240 / 512 / np=2 / c=2</code>，server 設定其他都一樣，只切 prefix cache 開 / 關：
+</p>
+<table>
+  <tr><th>Setting</th><th>Mean TTFT</th><th>Mean TPOT</th><th>Output thrpt</th><th>Total thrpt</th><th>GSM8K（連跑兩次）</th></tr>
+  <tr>
+    <td><code>--enable-prefix-caching</code><br/><span class="small">（default）</span></td>
+    <td><strong>25,948 ms</strong></td>
+    <td>562 ms</td>
+    <td>3.25 tok/s</td>
+    <td>68.18 tok/s</td>
+    <td><span class="warn">fresh 0.9375 → post1 0.75</span>（掉 3 doc）</td>
+  </tr>
+  <tr>
+    <td><code>--no-enable-prefix-caching</code></td>
+    <td>68,832 ms</td>
+    <td>548 ms</td>
+    <td>2.92 tok/s</td>
+    <td>61.27 tok/s</td>
+    <td><span class="ok">兩次都 0.875</span>（不掉）</td>
+  </tr>
+</table>
+<p class="small">
+log:<br/>
+&nbsp;&nbsp;• with prefix cache: <code>logs_0602_test_image_0602/vllm_tp8_deepseek_v4_pro_client_running_06030229.log</code><br/>
+&nbsp;&nbsp;• no prefix cache: <code>logs_0602_test_image_0602_disprex/vllm_tp8_deepseek_v4_pro_client_running_06030312.log</code>（acc log 同目錄）
+</p>
+<p>
+結果非常乾淨地證實 §3 的懷疑：
+</p>
+<ul>
+  <li><strong>prefix cache 對 TTFT 的收益巨大</strong>：68.8s → 25.9s，<strong>砍 62%</strong>（10240 input 的 prefill 大半被 cache 命中），Total throughput +11%。</li>
+  <li><strong>但 prefix cache 也是 acc drop 的放大器</strong>：開了之後 fresh 0.9375 → post1 0.75；關掉後兩次都 0.875、無方向性下降。</li>
+  <li>TPOT 兩個情境差不多（562 vs 548 ms），確認 prefix cache 主要影響的是 prefill 階段。</li>
+</ul>
+<p>
+所以目前這份 patch <strong>本身對連續跑（在無 prefix cache 下）已穩定</strong>，acc drop 是 prefix cache reuse 把殘餘 fp8 drift 累積到下一輪 fewshot prefix 上造成的。下一步要做的是：
+</p>
+<ol>
+  <li>用「<strong>open prefix cache + 重啟 server 跑 run2</strong>」做對照組——若兩次都 0.9375 → 確認 cache reuse 是唯一誘因；若仍掉 → 可能還有 KV blocks 之外的 drift channel。</li>
+  <li>調查 prefix cache hit 區段的 KV block fp8 累積誤差，看是否能在 patch 內加上「prefix cache eviction on long-decode boundary」之類的 mitigation，使 prefix cache 收益可以白拿。</li>
+</ol>
+
+<h2>5. Reproducer 指令</h2>
+
+<h3>5.1 啟動 server</h3>
+<p>
+進到 patched image 起的 container 內，下面是 server 啟動指令：
+</p>
+<pre>
+export VLLM_DSV4_MXFP4_ROUTED_KERNEL=1
+export VLLM_DSV4_MXFP4_ROUTED_RAGGED=0
+export VLLM_DSV4_MXFP4_RAGGED_OFFSET_GRID=0
+export VLLM_DSV4_MXFP4_METADATA_CAPACITY=128
+
+vllm serve /mnt/md0/models/DeepSeek-V4-Pro \
+  --trust-remote-code \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tensor-parallel-size 8 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-model-len 32768 \
+  --max-num-seqs 2 \
+  --gpu-memory-utilization 0.85 \
+  --distributed-executor-backend mp \
+  --host 0.0.0.0 \
+  --port 8023 \
+  --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8]}' \
+  --max-num-batched-tokens 1024 \
+  --disable-custom-all-reduce \
+  --no-enable-prefix-caching # 要不要加取決於複現哪組數據
+
+# 等到看到 "Application startup complete" 才能下 client
+</pre>
+
+<h4>Toggle 說明</h4>
+<table>
+  <tr><th>flag / env var</th><th>建議值</th><th>說明</th></tr>
+  <tr>
+    <td><code>--max-num-batched-tokens</code></td>
+    <td><code>1024</code></td>
+    <td>§4.1 sweep 過 <code>512 / 1024 / 2048 / 4096</code>。<strong>1024 是目前確定 acc stable的test case </strong>；<code>2048+</code> 雖然 TTFT 顯著降低，但 GSM8K 會方向性下滑。</td>
+  </tr>
+  <tr>
+    <td><code>--no-enable-prefix-caching</code></td>
+    <td>建議加</td>
+    <td>§4.2：<strong>加上此 flag 後 acc 污染已修復</strong>（兩次都 0.875，不掉），但 TTFT 從 25.9s → 68.8s（變慢 2.6 倍）。<strong>拿掉此 flag（即 enable prefix cache）的污染問題目前仍未解決</strong>，是 §3 仍待調查的主軸。</td>
+  </tr>
+  <tr>
+    <td><code>--disable-custom-all-reduce</code></td>
+    <td>必加</td>
+    <td>避免 ROCm custom AR 路徑與 sparse MLA / MoE 衝突。</td>
+  </tr>
+  <tr>
+    <td><code>--compilation-config</code> <code>cudagraph_mode</code></td>
+    <td><code>FULL_AND_PIECEWISE</code></td>
+    <td>本報告所有測試使用此模式。</td>
+  </tr>
+  <tr>
+    <td colspan="3"><strong>ATOM Triton FP4 SiLU routed MoE 路徑切換</strong>（functional toggle）</td>
+  </tr>
+  <tr>
+    <td><code>VLLM_DSV4_MXFP4_ROUTED_KERNEL</code></td>
+    <td><code>1</code></td>
+    <td>啟用本 patch 加入的 ATOM Triton FP4 SiLU routed MoE backend。<code>0</code> = fallback 回 default <code>Mxfp4MoeBackend</code>。</td>
+  </tr>
+  <tr>
+    <td><code>VLLM_DSV4_MXFP4_ROUTED_RAGGED</code></td>
+    <td><code>0</code></td>
+    <td><code>0</code> = padded stage1/2（<strong>capture-safe</strong>）；<code>1</code> = ragged stage1/2（per-expert tile loop，長 prefill 上有些許 perf 改善但需配合 OFFSET_GRID 才划算）。</td>
+  </tr>
+  <tr>
+    <td><code>VLLM_DSV4_MXFP4_RAGGED_OFFSET_GRID</code></td>
+    <td><code>0</code></td>
+    <td>只在 <code>ROUTED_RAGGED=1</code> 時生效，使 ragged 路徑少一輪 sync。單獨設此 flag 不會生效。</td>
+  </tr>
+  <tr>
+    <td><code>VLLM_DSV4_MXFP4_METADATA_CAPACITY</code></td>
+    <td><code>128</code></td>
+    <td>Active expert metadata buffer capacity。padding 容量上限，128 經驗值剛好不會 overflow 又不浪費 LDS。</td>
+  </tr>
+</table>
+
+<h3>5.2 GSM8K accuracy（fresh / post）</h3>
+<p>
+連跑兩次同一個 lm_eval 指令——第一次是 <code>fresh</code>，server 不重啟立刻跑第二次就是 <code>post1</code>（看 wrong-doc set 變化）：
+</p>
+<pre># LIMIT=16 smoke 版（用於誘發 / instability 觀察，非 final acc）
+lm_eval \
+  --model local-completions \
+  --model_args model=/mnt/md0/models/DeepSeek-V4-Pro,base_url=http://localhost:8023/v1/completions,num_concurrent=2,tokenized_requests=False,tokenizer_backend=none,max_retries=10,max_gen_toks=2048,timeout=7200,trust_remote_code=True,eos_string=Question: \
+  --batch_size auto \
+  --tasks gsm8k \
+  --num_fewshot 8 \
+  --limit 16 \
+  --log_samples \
+  --output_path /data/results_conc_2_fewshot_8_limit_16_gsm8k \
+  --gen_kwargs temperature=0
+</pre>
+<p class="small">
+跑完後輸出目錄會有 <code>results_*.json</code> + <code>samples_gsm8k_*.jsonl</code>。
+要驗 instability 範圍：把同樣指令跑 3-5 次，每次的 strict-match / flexible-extract 一起看，能直接量出 ±0.0625 ~ ±0.1875 的 sampling 雜訊區間。
+</p>
+
+<h3>5.3 Benchmark / trigger（perf + 誘發長 decode）</h3>
+<p>
+§4.1 / §4.2 的 perf 數字、§2.1 的 trigger 都是這條 <code>vllm bench serve</code>（input/output/np/c 不同）：
+</p>
+<pre># §2.1 / §4 用的 random bench：input=10240, output=512, np=2, c=2
+vllm bench serve \
+  --base-url http://localhost:8023 \
+  --model /mnt/md0/models/DeepSeek-V4-Pro \
+  --tokenizer /mnt/md0/models/DeepSeek-V4-Pro \
+  --dataset-name random \
+  --random-input-len 10240 \
+  --random-output-len 512 \
+  --num-prompts 2 \
+  --max-concurrency 2 \
+  --num-warmups 1 \
+  --temperature 0 \
+  --save-result \
+  --result-filename /data/vllm_random_2_10240_512_2.jsonl
+</pre>
+<p class="small">
+要做 §2.1 那種 trigger threshold scan：對 <code>random-input-len × random-output-len × num-prompts × max-concurrency</code> 做 8 cell 矩陣（4096/6144/8192/10240 × 128/256/512），每 cell 的順序為
+<code>fresh GSM8K → vllm bench serve（trigger） → post1 GSM8K</code>，期間不重啟 server，就可以看出哪個 trigger 強度才會誘發 post1 &lt; fresh。
+</p>
+
+<h3>5.4 完整 reproduce 流程</h3>
+<pre>
+# 1. 啟動 server（一次）
+啟動server # 等到 Application startup complete
+# 若--no-enable-prefix-caching => 已經修復不會汙染 
+# 若DISABLE_PREFIX_CACHING=0 => 性能較好，但仍有掉分汙染 
+
+# 2. fresh GSM8K
+跑gsm8k acc test                  # §5.2 的 lm_eval 指令
+
+# 3. trigger（§5.3 的 vllm bench serve）
+跑一組會觸發(長decode)的benchmark               # random 10240/512/np=2/c=2 bench
+
+# 4. post1 GSM8K（同 server 不重啟直接再測試一次）
+跑gsm8k acc test
+
+# 5. 比 fresh / post1 數字 + wrong-doc set
+</pre>
 
 <hr/>
 <p class="small">
