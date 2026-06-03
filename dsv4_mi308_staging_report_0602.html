@@ -80,14 +80,33 @@
 <p>
 過去實驗中發現提高 <code>MAX_NUM_BATCHED_TOKENS</code>（從 default <code>1024</code> 拉到更大）可以降低 prefill TTFT、改善整體 wall-clock，
 但在 GSM8K LIMIT=16 上會出現方向性下滑。
+</p>
+
+<p>
+TTFT / throughput 對 <code>MAX_NUM_BATCHED_TOKENS</code> 的 sweep（<strong>0520 的數據，<span class="warn">在 acc 污染修補（FP8 cast / RoPE / RMSNorm round-trip）之前</span></strong>，bench 配置 <code>random 10240 / 512 / np=2 / c=2</code>）：
+</p>
+<table>
+  <tr><th>MAX_NUM_BATCHED_TOKENS</th><th>Mean TTFT</th><th>Mean TPOT</th><th>Output thrpt</th><th>Total thrpt</th><th>GSM8K acc</th></tr>
+  <tr><td><code>512</code></td><td>46,961 ms</td><td>498 ms</td><td>3.36 tok/s</td><td>70.46 tok/s</td><td>—（baseline）</td></tr>
+  <tr><td><code>1024</code></td><td>34,286 ms</td><td>479 ms</td><td>3.65 tok/s</td><td>76.56 tok/s</td><td>—</td></tr>
+  <tr><td><code>2048</code></td><td>26,911 ms</td><td>477 ms</td><td>3.77 tok/s</td><td>79.07 tok/s</td><td><span class="warn">會掉</span></td></tr>
+  <tr><td><code>4096</code></td><td><strong>22,717 ms</strong></td><td>460 ms</td><td>3.96 tok/s</td><td>83.22 tok/s</td><td><span class="warn">會掉</span></td></tr>
+</table>
+<p class="small">
+log: <code>logs_0520_test_full/vllm_tp8_deepseek_v4_pro_client_running_0520{2058,2128,2142,2155}.log</code>。
+acc 確切數字請參考歷史紀錄；本表僅作 perf 趨勢與「acc 會掉」的方向性提示。
+</p>
+<p>
+<strong>TTFT 從 47s → 23s（砍 51%），Total throughput +18%</strong>。但 acc 在 <code>2048+</code> 走方向性下滑。
 診斷時對較大 batch 做 routed MoE compare：cosine 趨近 <code>1.0</code>，但個別 element <code>max_abs</code> 仍偏大，
 意味著聚合方向沒問題、但個別 logit 已經偏離過多。<strong>所以拉高 batched-tokens 的 TTFT 改善是付出 acc 的代價換來的</strong>，
 不能直接調作 accuracy-stable 的主線設定。
 </p>
 <p class="small">
-進一步追蹤方向：(a) 在較大 batch 下逐個關閉 ragged / offset-grid / deterministic-reduce，看是哪個環節在 batch 增大時數值不穩；
-(b) 試大 batch + <code>CONC=1</code> 配合 chunked prefill 重切，避免 single-batch 內 routed accumulation 過長；
-(c) 比對不同 <code>MAX_NUM_BATCHED_TOKENS</code> 的 wrong-doc set，看哪些 doc 是大 batch 才壞，可以反推 fp8 drift 的觸發條件。
+進一步追蹤方向：(a) 用本次 patch（FP8 cast / RoPE / RMSNorm round-trip）後的 image 重跑同一組 sweep，看 acc 下滑是否被 patch 修掉，TTFT 收益就可以白拿；
+(b) 在較大 batch 下逐個關閉 ragged / offset-grid / deterministic-reduce，看是哪個環節在 batch 增大時數值不穩；
+(c) 試大 batch + <code>CONC=1</code> 配合 chunked prefill 重切，避免 single-batch 內 routed accumulation 過長；
+(d) 比對不同 <code>MAX_NUM_BATCHED_TOKENS</code> 的 wrong-doc set，看哪些 doc 是大 batch 才壞，可以反推 fp8 drift 的觸發條件。
 </p>
 
 <hr/>
