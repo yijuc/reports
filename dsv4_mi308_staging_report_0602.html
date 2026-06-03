@@ -285,8 +285,8 @@ vllm bench serve \
 <pre>
 # 1. 啟動 server（一次）
 啟動server # 等到 Application startup complete
-# 若--no-enable-prefix-caching => 已經修復不會汙染 
-# 若DISABLE_PREFIX_CACHING=0 => 性能較好，但仍有掉分汙染 
+# 若 --no-enable-prefix-caching => 已經修復汙染問題，目前不會掉分 
+# 若不加 --no-enable-prefix-caching => 性能較好，但仍有掉分汙染 
 
 # 2. fresh GSM8K
 跑gsm8k acc test                  # §5.2 的 lm_eval 指令
