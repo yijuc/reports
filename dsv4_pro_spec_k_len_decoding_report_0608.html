@@ -39,6 +39,7 @@
   footer{color:var(--muted);font-size:11px;margin-top:26px;border-top:1px solid var(--line);
          padding-top:12px;word-break:break-all;line-height:1.7}
   .hint{color:var(--muted);font-size:12px;margin-top:4px}
+  .d{color:var(--muted);font-size:12px}
 </style>
 </head>
 <body>
@@ -81,21 +82,22 @@
   <h2>2. Benchmark 比較</h2>
   <div class="card">
     <table>
-      <thead><tr><th>指標</th><th>k=1</th><th>k=2</th><th>k=3</th></tr></thead>
+      <thead><tr><th>指標</th><th>k=1 (baseline)</th><th>k=2</th><th>k=3</th></tr></thead>
       <tbody>
-        <tr><td>Output throughput tok/s ↑</td><td>13.83</td><td>16.99</td><td class="best">19.13</td></tr>
-        <tr><td>TPOT mean (ms) ↓</td><td>121.17</td><td>94.32</td><td class="best">78.50</td></tr>
-        <tr><td>TPOT P99 (ms) ↓</td><td>139.78</td><td>115.24</td><td class="best">94.43</td></tr>
-        <tr><td>Duration (s) ↓</td><td>74.03</td><td>60.27</td><td class="best">53.52</td></tr>
-        <tr><td>Acceptance length ↑</td><td>1.98</td><td>2.88</td><td class="best">3.66</td></tr>
-        <tr><td>TTFT mean (ms) ↓</td><td class="best">11498.89</td><td>11535.29</td><td>12445.76</td></tr>
-        <tr><td>ITL mean (ms) ↓</td><td class="best">239.99</td><td>271.54</td><td>286.52</td></tr>
-        <tr><td>ITL P99 (ms) ↓</td><td class="best">352.08</td><td class="warn">2950.81</td><td class="bad">3437.41</td></tr>
-        <tr><td>Acceptance rate (%) ↑</td><td class="best">98.26</td><td>93.94</td><td>88.57</td></tr>
+        <tr><td>Output throughput tok/s ↑</td><td>13.83</td><td>16.99 <span class="d">(+22.8%)</span></td><td class="best">19.13 <span class="d">(+38.3%)</span></td></tr>
+        <tr><td>TPOT mean (ms) ↓</td><td>121.17</td><td>94.32 <span class="d">(−22.2%)</span></td><td class="best">78.50 <span class="d">(−35.2%)</span></td></tr>
+        <tr><td>TPOT P99 (ms) ↓</td><td>139.78</td><td>115.24 <span class="d">(−17.6%)</span></td><td class="best">94.43 <span class="d">(−32.4%)</span></td></tr>
+        <tr><td>Duration (s) ↓</td><td>74.03</td><td>60.27 <span class="d">(−18.6%)</span></td><td class="best">53.52 <span class="d">(−27.7%)</span></td></tr>
+        <tr><td>Acceptance length ↑</td><td>1.98</td><td>2.88 <span class="d">(+45.5%)</span></td><td class="best">3.66 <span class="d">(+84.8%)</span></td></tr>
+        <tr><td>TTFT mean (ms) ↓</td><td class="best">11498.89</td><td>11535.29 <span class="d">(+0.3%)</span></td><td>12445.76 <span class="d">(+8.2%)</span></td></tr>
+        <tr><td>ITL mean (ms) ↓</td><td class="best">239.99</td><td>271.54 <span class="d">(+13.1%)</span></td><td>286.52 <span class="d">(+19.4%)</span></td></tr>
+        <tr><td>ITL P99 (ms) ↓</td><td class="best">352.08</td><td class="warn">2950.81 <span class="d">(+738%)</span></td><td class="bad">3437.41 <span class="d">(+876%)</span></td></tr>
+        <tr><td>Acceptance rate (%) ↑</td><td class="best">98.26</td><td>93.94 <span class="d">(−4.4%)</span></td><td>88.57 <span class="d">(−9.9%)</span></td></tr>
         <tr><td>Per-position acc (%)</td><td>98.26</td><td>96.34 / 91.55</td><td>95.71 / 89.64 / 80.36</td></tr>
       </tbody>
     </table>
-    <div class="hint">綠底＝該列最佳；ITL P99 以橘/紅標示惡化。</div>
+    <div class="hint">括號＝相對 <b>k=1 baseline</b> 的變化。↑/↓＝該指標好方向（非總體勝負；如 acceptance rate 隨 k 下降屬正常）。<br>
+    <b>划算直接看 TPOT：越低越划算</b>（k=3 −35.2% 最佳）。〔機制：TPOT = ITL ÷ acceptance length，故 TPOT 下降 ⟺ acceptance length 漲幅 &gt; ITL 漲幅〕。綠底＝該列最佳；ITL P99 橘/紅標示惡化。</div>
   </div>
 
   <h2>3. Accuracy 比較（gsm8k 全量，門檻 0.9）</h2>
