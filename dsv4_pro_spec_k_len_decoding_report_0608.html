@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MTP Speculative Decoding 比較報告 — eveline_dsv4_0605</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#171a21; --line:#272b34; --txt:#e6e8ec; --muted:#9aa3b2;
+    --best:#10b981; --best-bg:rgba(16,185,129,.14); --warn:#f59e0b; --bad:#ef4444;
+    --accent:#60a5fa;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;
+       line-height:1.55;padding:32px 18px}
+  .wrap{max-width:960px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 4px}
+  h2{font-size:16px;margin:28px 0 10px;color:var(--accent);
+     border-left:3px solid var(--accent);padding-left:10px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:16px 18px;margin:14px 0}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;text-align:center;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left;color:var(--muted);white-space:nowrap}
+  thead th{color:var(--txt);font-weight:600;border-bottom:2px solid var(--line)}
+  td.best{background:var(--best-bg);color:var(--best);font-weight:700;border-radius:4px}
+  td.warn{color:var(--warn)} td.bad{color:var(--bad);font-weight:600}
+  .pass{color:var(--best);font-weight:700}
+  code,pre{font-family:"SF Mono",Menlo,Consolas,monospace}
+  pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;
+      padding:12px 14px;overflow-x:auto;font-size:13px;color:#cbd5e1}
+  .tag{display:inline-block;background:#0b0d11;border:1px solid var(--line);
+       border-radius:6px;padding:1px 8px;font-size:12px;color:var(--muted);margin:2px 0}
+  .verdict li{margin:6px 0}
+  .trade{border-left:3px solid var(--warn);background:rgba(245,158,11,.08);
+         padding:10px 14px;border-radius:8px;margin-top:10px}
+  footer{color:var(--muted);font-size:11px;margin-top:26px;border-top:1px solid var(--line);
+         padding-top:12px;word-break:break-all;line-height:1.7}
+  .hint{color:var(--muted);font-size:12px;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>MTP Speculative Decoding 比較報告</h1>
+  <div class="sub">container <code>eveline_dsv4_0605</code> · DeepSeek-V4-Pro · 變因：<b>num_speculative_tokens (k = 1 / 2 / 3)</b> · 2026-06-08</div>
+
+  <div class="card" style="border-left:3px solid var(--best)">
+    <b>結論摘要 (TL;DR)</b>
+    <ul style="margin:8px 0 0">
+      <li><b>k=3 吞吐/延遲最佳</b>：TPOT −35%、output throughput +38%、duration −28%（vs k=1）。</li>
+      <li><b>正確性 lossless</b>：三組 gsm8k 全量 0.953–0.957，皆 &gt; 0.9 門檻，差異在雜訊內。</li>
+      <li><b>唯一隱憂</b>：<b>P99 尾延遲隨 k 急升</b>（352 → 3437 ms）。離線拼吞吐選 <b>k=3</b>；互動 / 有 SLA 需先用大量 request 重測 P99。建議續測 k=4。</li>
+    </ul>
+  </div>
+
+  <h2>1. 環境與設定</h2>
+  <div class="card">
+    <p><b>固定基準（三組相同）</b></p>
+    <span class="tag">vllm 0.22.1rc1.dev135+gec8d60bea</span>
+    <span class="tag">TP = 8</span>
+    <span class="tag">CompilationMode VLLM_COMPILE (mode 3)</span>
+    <span class="tag">CUDAGraph FULL_AND_PIECEWISE</span>
+    <span class="tag">kv-cache-dtype fp8_e4m3</span>
+    <span class="tag">bench concurrency 2 · 2 prompts · 10240-in / 512-out</span>
+    <span class="tag">acc gsm8k 8-shot · limit=None · temp=0</span>
+
+    <p style="margin-top:14px"><b>變因（差異在 server 指令）</b></p>
+    <table>
+      <thead><tr><th>變因</th><th>k=1</th><th>k=2</th><th>k=3</th></tr></thead>
+      <tbody><tr><td>num_speculative_tokens</td><td>1</td><td>2</td><td>3</td></tr></tbody>
+    </table>
+
+    <div class="trade">⚠️ <b>Confound check</b>：三份 server log 確認僅 <code>num_speculative_tokens</code> 不同，
+      <code>fp8_e4m3</code>、<code>FULL_AND_PIECEWISE</code>、<code>VLLM_COMPILE</code>、TP=8 全一致
+      → <b>apples-to-apples，比較有效</b>。</div>
+  </div>
+
+  <h2>2. Benchmark 比較</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>指標</th><th>k=1</th><th>k=2</th><th>k=3</th></tr></thead>
+      <tbody>
+        <tr><td>Output throughput tok/s ↑</td><td>13.83</td><td>16.99</td><td class="best">19.13</td></tr>
+        <tr><td>TPOT mean (ms) ↓</td><td>121.17</td><td>94.32</td><td class="best">78.50</td></tr>
+        <tr><td>TPOT P99 (ms) ↓</td><td>139.78</td><td>115.24</td><td class="best">94.43</td></tr>
+        <tr><td>Duration (s) ↓</td><td>74.03</td><td>60.27</td><td class="best">53.52</td></tr>
+        <tr><td>Acceptance length ↑</td><td>1.98</td><td>2.88</td><td class="best">3.66</td></tr>
+        <tr><td>TTFT mean (ms) ↓</td><td class="best">11498.89</td><td>11535.29</td><td>12445.76</td></tr>
+        <tr><td>ITL mean (ms) ↓</td><td class="best">239.99</td><td>271.54</td><td>286.52</td></tr>
+        <tr><td>ITL P99 (ms) ↓</td><td class="best">352.08</td><td class="warn">2950.81</td><td class="bad">3437.41</td></tr>
+        <tr><td>Acceptance rate (%) ↑</td><td class="best">98.26</td><td>93.94</td><td>88.57</td></tr>
+        <tr><td>Per-position acc (%)</td><td>98.26</td><td>96.34 / 91.55</td><td>95.71 / 89.64 / 80.36</td></tr>
+      </tbody>
+    </table>
+    <div class="hint">綠底＝該列最佳；ITL P99 以橘/紅標示惡化。</div>
+  </div>
+
+  <h2>3. Accuracy 比較（gsm8k 全量，門檻 0.9）</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>指標</th><th>k=1</th><th>k=2</th><th>k=3</th></tr></thead>
+      <tbody>
+        <tr><td>flexible-extract</td><td class="best">0.9568</td><td>0.9538</td><td>0.9530</td></tr>
+        <tr><td>strict-match</td><td class="best">0.9575</td><td>0.9545</td><td>0.9538</td></tr>
+        <tr><td>stderr (±)</td><td>0.0056</td><td>0.0058</td><td>0.0058</td></tr>
+        <tr><td>門檻 0.9（全量）</td><td class="pass">PASS</td><td class="pass">PASS</td><td class="pass">PASS</td></tr>
+      </tbody>
+    </table>
+    <div class="hint">三組差 ≤ 0.004 &lt; 1×stderr → 屬雜訊，視為 <b>lossless</b>（投機解碼不影響正確性，符合預期）。門檻：<b>全量 gsm8k = 0.9</b>；limit 16 小樣本才用 0.8。三組 0.953–0.957 皆 &gt; 0.9。</div>
+  </div>
+
+  <h2>4. 結論與建議</h2>
+  <div class="card verdict">
+    <ul>
+      <li><b>吞吐/延遲均速：k=3 全贏</b> — TPOT 78.5 vs 121.17（−35%）、throughput 19.13 vs 13.83（+38%）、duration −28%；acceptance length 漲到 3.66。</li>
+      <li><b>正確性：lossless</b> — 三組 0.953–0.957，差異在雜訊內，皆 &gt; 0.9（全量門檻）。</li>
+    </ul>
+    <div class="trade">
+      ⚠️ <b>Tradeoff</b>：k 越大 <b>P99 ITL 急遽惡化</b>（352 → 2951 → 3437 ms），TTFT、acceptance rate 也略差。<br>
+      • 離線 / 批次 / 拼吞吐 → 選 <b>k=3</b>（可再試 k=4）。<br>
+      • 互動 / 有 P99 latency SLA → P99 尾延遲是風險，需用<b>大量 request 重測 P99</b> 確認非雜訊（本次僅 2 prompts，尾延遲樣本不可靠）。
+    </div>
+  </div>
+
+  <h2>5. 復現指令</h2>
+  <div class="card">
+    <div class="hint" style="margin-bottom:8px">三組唯一差別：server 的 <code>--speculative-config</code> 的 num_speculative_tokens（1/2/3）；benchmark / acc 三組相同。</div>
+<pre># ---- server（k=1；k=2 改 2 / k=3 改 3）----
+export PYTHONPATH=/opt/vllm/:$PYTHONPATH
+export VLLM_ROCM_USE_AITER=1
+vllm serve /mnt/md0/models/DeepSeek-V4-Pro \
+  --host localhost --port 8001 --dtype auto \
+  --tensor-parallel-size 8 --trust-remote-code \
+  --gpu-memory-utilization 0.78 --max-model-len 32768 --max-num-batched-tokens 2048 \
+  --moe-backend triton_unfused --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 \
+  --async-scheduling --disable-custom-all-reduce \
+  --kv-cache-dtype fp8_e4m3 \
+  --compilation-config '{"mode":3,"cudagraph_mode": "FULL_AND_PIECEWISE", "max_cudagraph_capture_size": 64}' \
+  --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":1}'   # ← 變因
+
+# ---- benchmark（三組相同）----
+vllm bench serve \
+  --base-url http://localhost:8001 \
+  --model /mnt/md0/models/DeepSeek-V4-Pro --tokenizer /mnt/md0/models/DeepSeek-V4-Pro \
+  --dataset-name random --random-input-len 10240 --random-output-len 512 \
+  --num-prompts 2 --max-concurrency 2 --num-warmups 1 --temperature 0
+
+# ---- acc（三組相同；全量 gsm8k）----
+lm_eval --model local-completions \
+  --model_args model=/mnt/md0/models/DeepSeek-V4-Pro,base_url=http://localhost:8001/v1/completions,num_concurrent=2,tokenized_requests=False,tokenizer_backend=none,max_retries=10,max_gen_toks=2048,timeout=7200,trust_remote_code=True,eos_string=Question: \
+  --batch_size auto --tasks gsm8k --num_fewshot 8 --gen_kwargs temperature=0</pre>
+  </div>
+
+  <footer>
+    資料來源 —
+    bench: k=1 /opt/scripts/benchmark_speculative1.log · k=2 /opt/scripts/benchmark_speculative2.log · k=3 /opt/scripts/benchmark_speculative3.log ｜
+    acc: k=1 /opt/scripts/acc_post1_spec1.log · k=2 /opt/scripts/acc_post1_spec2.log · k=3 /opt/scripts/acc_post1_spec3.log ｜
+    server: /opt/scripts/server_speculative1.log · /opt/scripts/server_speculative2.log · /opt/scripts/server_speculative3.log
+    <br>container eveline_dsv4_0605 · 報告生成於 2026-06-08
+  </footer>
+
+</div>
+</body>
+</html>
